@@ -19,7 +19,9 @@ from vllm.model_executor.parallel_utils.parallel_state import (
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.model_runner import ModelRunner
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
@@ -153,6 +155,21 @@ class Worker:
             self.model_runner.remove_all_loras()
         gc.collect()
         torch.cuda.empty_cache()
+
+        try:
+            import llm_server
+            num_gpu_blocks = llm_server.get_num_gpu_kv_cache_blocks()
+            logger.info(f'using llm_server to determine gpu_blocks, '
+                        f'total_gpu_blocks_memory: {num_gpu_blocks * cache_block_size / 1024 / 1024} MiB, '
+                        f' num_gpu_blocks: {num_gpu_blocks}, num_cpu_blocks: {num_cpu_blocks}')
+            return num_gpu_blocks, num_cpu_blocks
+        except ImportError:
+            pass
+
+        logger.info(f'total_gpu_memory: {total_gpu_memory / 1024 / 1024} MiB, gpu_mem_util {gpu_memory_utilization}, '
+                    f'init_gpu_memory {self.init_gpu_memory / 1024 / 1024} MiB, peak_memory: {peak_memory / 1024 / 1024} MiB, '
+                    f'current_gpu_free_memory {free_gpu_memory / 1024 / 1024} MiB, '    
+                    f'cache_block_size: {cache_block_size}, num_gpu_blocks: {num_gpu_blocks}, num_cpu_blocks: {num_cpu_blocks}')
         return num_gpu_blocks, num_cpu_blocks
 
     def init_cache_engine(self, cache_config: CacheConfig) -> None:

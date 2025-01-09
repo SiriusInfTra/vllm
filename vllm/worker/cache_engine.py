@@ -59,12 +59,32 @@ class CacheEngine:
             num_blocks, self.block_size, self.num_heads, self.head_size)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         kv_cache: List[torch.Tensor] = []
-        for _ in range(self.num_layers):
-            kv_cache.append(
-                torch.empty(kv_cache_shape,
-                            dtype=self.dtype,
-                            pin_memory=pin_memory,
-                            device=device))
+
+        use_llm_server_kv_cache_pool = False
+        if device == "cuda":
+            try:
+                import llm_server
+                use_llm_server_kv_cache_pool = llm_server.use_kv_cache_pool()
+                logger.info(f'Using llm_server KV cache pool, block shape {kv_cache_shape}')
+            except ImportError:
+                pass
+
+        for layer_idx in range(self.num_layers):
+            if not use_llm_server_kv_cache_pool:
+                kv_cache.append(
+                    torch.empty(kv_cache_shape,
+                                dtype=self.dtype,
+                                pin_memory=pin_memory,
+                                device=device))
+            else:
+                _kv_cache_ts: torch.Tensor = llm_server.init_kv_cache(
+                    layer_idx,
+                    list(kv_cache_shape),
+                    str(self.dtype),
+                    self.dtype.itemsize,
+                )
+                # logger.info(f'layer {layer_idx} block shape {list(kv_cache_shape)} dtype {self.dtype} | ts shape {_kv_cache_ts.shape} dtype {_kv_cache_ts.dtype}')
+                kv_cache.append(_kv_cache_ts)
         return kv_cache
 
     def swap_in(self, src_to_dst: Dict[int, int]) -> None:
@@ -99,6 +119,19 @@ class CacheEngine:
         else:
             dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
         dtype_size = _get_dtype_size(dtype)
+
+        logger.info(f'[CacheEngine] block size: \n'
+            f'\thead_size {head_size} num_heads {num_heads} num_layers {num_layers} '
+            f'key_cache_block {key_cache_block} value_cache_block {value_cache_block} '
+            f'total {total} dtype_size {dtype_size} | {dtype_size * total / 1024 / 1024} MiB')
+        try:
+            import llm_server
+            llm_server.maybe_set_kv_cache_block_nbytes(
+                block_size, num_layers, num_heads, head_size, dtype_size * total
+            )
+        except ImportError:
+            logger.warning('llm_server not found')
+
         return dtype_size * total
 
 

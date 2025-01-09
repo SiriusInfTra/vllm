@@ -15,6 +15,12 @@ disable_created_metrics()
 # The begin-* and end* here are used by the documentation generator
 # to extract the metrics definitions.
 
+try:
+    import llm_server
+    _use_llm_server_kv_cache_pool = llm_server.use_kv_cache_pool()
+except ImportError:
+    _use_llm_server_kv_cache_pool = False
+
 
 # begin-metrics-definitions
 class Metrics:
@@ -214,6 +220,20 @@ class StatLogger:
                 prompt_throughput=prompt_throughput,
                 generation_throughput=generation_throughput)
 
+            kv_cache_pool_info = ""
+            if _use_llm_server_kv_cache_pool:
+                kv_cache_pool_stat = llm_server.get_kv_cache_pool_stat()
+                if kv_cache_pool_stat.num_allocated_blk_grps == 0:
+                    mem_page_util = "Nan"
+                else:
+                    mem_page_util = "{:.2f}".format(
+                        1 - kv_cache_pool_stat.num_idle_blk_grps / kv_cache_pool_stat.num_allocated_blk_grps)
+                kv_cache_pool_info = ", KVCacheMemPageUtil {}({}/{})".format(
+                    mem_page_util, 
+                    kv_cache_pool_stat.num_allocated_blk_grps - kv_cache_pool_stat.num_idle_blk_grps,
+                    kv_cache_pool_stat.num_allocated_blk_grps
+                )
+
             # Log to stdout.
             logger.info(
                 f"Avg prompt throughput: {prompt_throughput:.1f} tokens/s, "
@@ -223,7 +243,8 @@ class StatLogger:
                 f"Swapped: {stats.num_swapped} reqs, "
                 f"Pending: {stats.num_waiting} reqs, "
                 f"GPU KV cache usage: {stats.gpu_cache_usage * 100:.1f}%, "
-                f"CPU KV cache usage: {stats.cpu_cache_usage * 100:.1f}%")
+                f"CPU KV cache usage: {stats.cpu_cache_usage * 100:.1f}%"
+                f"{kv_cache_pool_info}")
 
             # Reset tracked stats for next interval.
             self.num_prompt_tokens = []

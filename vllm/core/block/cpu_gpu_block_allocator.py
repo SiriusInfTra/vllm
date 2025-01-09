@@ -5,6 +5,7 @@ from vllm.core.block.interfaces import (Block, BlockAllocator,
 from vllm.core.block.naive_block import NaiveBlock, NaiveBlockAllocator
 from vllm.core.block.prefix_caching_block import PrefixCachingBlockAllocator
 from vllm.utils import Device
+from vllm.core.block.naive_dynamic_block import NaiveDynamicBlockAllocator
 
 
 class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
@@ -57,12 +58,30 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         cpu_block_ids = block_ids[num_gpu_blocks:]
 
         if allocator_type == "naive":
-            gpu_allocator = NaiveBlockAllocator(
-                create_block=NaiveBlock,
-                num_blocks=num_gpu_blocks,
-                block_size=block_size,
-                block_ids=gpu_block_ids,
-            )
+            try:
+                import llm_server
+                if llm_server.use_kv_cache_pool():
+                    llm_server.info("[CpuGpuBlockAllocator] use llm_server kv-cache pool")
+                    gpu_allocator = NaiveDynamicBlockAllocator(
+                        create_block=NaiveBlock,
+                        num_blocks=num_gpu_blocks,
+                        block_size=block_size,
+                        block_ids=gpu_block_ids,
+                    )
+                else:
+                    gpu_allocator = NaiveBlockAllocator(
+                        create_block=NaiveBlock,
+                        num_blocks=num_gpu_blocks,
+                        block_size=block_size,
+                        block_ids=gpu_block_ids,
+                    )    
+            except ImportError:
+                gpu_allocator = NaiveBlockAllocator(
+                    create_block=NaiveBlock,
+                    num_blocks=num_gpu_blocks,
+                    block_size=block_size,
+                    block_ids=gpu_block_ids,
+                )
 
             cpu_allocator = NaiveBlockAllocator(
                 create_block=NaiveBlock,
