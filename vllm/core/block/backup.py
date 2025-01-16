@@ -1,16 +1,14 @@
 from __future__ import annotations
-import os, sys
-import time
 from typing import Dict, Generic, Iterable, Iterator, List, Optional, Set, Tuple, TypeVar
 
 import torch
 import builtins
 
-
+from vllm.attention.backends.abstract import AttentionMetadata
+from vllm.attention.ops.paged_attn import PagedAttentionMetadata
 from vllm.core.block.common import (CopyOnWriteTracker, RefCounter,
                                     get_all_blocks_recursively)
 from vllm.core.block.interfaces import Block, BlockAllocator
-
 
 BlockId = int
 Refcount = int
@@ -35,22 +33,42 @@ import math
 from typing import List, Dict, Optional
 
 
-_COLSYS_VLLM_NUM_BLOCK = None
-if 'COLSYS_VLLM_NUM_BLOCK' in os.environ:
-    _COLSYS_VLLM_NUM_BLOCK = int(os.environ['COLSYS_VLLM_NUM_BLOCK'])
-    assert _COLSYS_VLLM_NUM_BLOCK > 0
-    assert _COLSYS_VLLM_NUM_BLOCK <= 4096
-    llm_server.info_with_frame(f'set _COLSYS_VLLM_NUM_BLOCK {_COLSYS_VLLM_NUM_BLOCK}')
-
-
 T = TypeVar('T')
+
+# class PriorityQueue(Generic[T]):
+#     def __init__(self):
+#         self._queue: list[T] = []
+#         self._index = 0
+        
+#     def push(self, item: T) -> None:
+#         heapq.heappush(self._queue, item)
+#         self._index += 1
+        
+#     def pop(self) -> T:
+#         if not self._queue:
+#             raise IndexError("pop from an empty queue")
+#         return heapq.heappop(self._queue)
+    
+#     def peek(self) -> T:
+#         if not self._queue:
+#             raise IndexError("peek at an empty queue")
+#         return self._queue[0]
+    
+#     def empty(self) -> bool:
+#         return len(self._queue) == 0
+    
+#     def size(self) -> int:
+#         return len(self._queue)
+    
+#     def __iter__(self) -> Iterator[T]:
+#         return iter(self._queue)
 
 class PriorityQueue(Generic[T]):
     def __init__(self):
         self._queue: list[T] = []
         self._index = 0
         
-    def append(self, item: T) -> None:
+    def push(self, item: T) -> None:
         heapq.heappush(self._queue, item)
         self._index += 1
         
@@ -64,18 +82,16 @@ class PriorityQueue(Generic[T]):
             raise IndexError("peek at an empty queue")
         return self._queue[0]
     
+    def remove(self, )
+    
     def empty(self) -> bool:
         return len(self._queue) == 0
-
-    def size(self) -> int:
-        return len(self._queue)
     
-    def __len__(self) -> int:
+    def size(self) -> int:
         return len(self._queue)
     
     def __iter__(self) -> Iterator[T]:
         return iter(self._queue)
-
     
 BLOCK_NBYTES = int(12.5 * 1024 * 1024)
 BLOCK_PER_LAYER_NBYTES = BLOCK_NBYTES // 40
@@ -138,16 +154,8 @@ class PageManager:
         self.pages_by_id = dict[int, MemPageItem]()
         self.pages_by_blk = dict[int, MemPage]()
         self.n_blocks_per_page = n_blocks_per_page
-        self.num_blocks_in_used = 0
-        if _COLSYS_VLLM_NUM_BLOCK is not None:
-            self.num_blocks_free = _COLSYS_VLLM_NUM_BLOCK * 40
-        else:
-            # over predict 2000MB : 3276 * 40
-            self.num_blocks_free = 3112 * 40
         self.translator = translator
-        # self.translator.always_available_page_id = self.alloc_block_ids(1)[0]
         # self._test_page_ids = list(range(n_pages))
-        llm_server.info(f'PageManager init with {self.num_blocks_free} free blocks, used block {self.num_blocks_in_used}')
 
 
     def _new_page(self, n = 1) -> None:
@@ -161,54 +169,50 @@ class PageManager:
             self.pages_by_id[page_id] = item
             for block_id in page.free_layer_block_ids:
                 self.pages_by_blk[block_id] = page
-            self.pages_by_n_free.append(item)
-            # logger.info(f'Create New Page {page.page_id}')
+            self.pages_by_n_free.push(item)
+            logger.info(f'Create New Page {page.page_id}')
     
     def _update_page(self, page: MemPage) -> None:
         page.op_c += 1 # invalidate the free queue
-        self.pages_by_n_free = [item for item in self.pages_by_n_free if item.page.page_id != page.page_id]
-
         if page.n_free == self.n_blocks_per_page:
             assert len(page.used_layer_block_ids) == 0
             del self.pages_by_id[page.page_id]
             # logger.info(f'Delete Page {page.page_id}')
             for block_id in page.free_layer_block_ids:
                 del self.pages_by_blk[block_id]
-            # logger.info(f'Remove Page {page.page_id}')
+            logger.info(f'Remove Page {page.page_id}')
             llm_server.free_kv_cache_block([page.page_id])
-            # for vllm_blk_id, blk_ids_by_layer in self.translator.layer_meta.items():
-            #     assert len(set(page.free_layer_block_ids).intersection(blk_ids_by_layer.block_id_by_layer)) == 0
+            for vllm_blk_id, blk_ids_by_layer in self.translator.layer_meta.items():
+                assert len(set(page.free_layer_block_ids).intersection(blk_ids_by_layer.block_id_by_layer)) == 0
             # self._test_page_ids.append(page.page_id)
         else:
             item = MemPageItem(page=page)
             self.pages_by_id[page.page_id] = item 
-            self.pages_by_n_free.append(item)
+            self.pages_by_n_free.push(item)
     
     def get_num_free_blocks(self) -> int:
-        return self.num_blocks_free // 40
-        free_nbytes = llm_server.get_num_free_nbytes()
-        free_nbytes -= self.num_blocks_in_used * BLOCK_PER_LAYER_NBYTES
+        free_nbytes = llm_server.get_num_free_blocks() * int(32 * 1024 * 1024)
+        free_nbytes += sum(item.n_free * BLOCK_PER_LAYER_NBYTES if item.valid else 0 for item in iter(self.pages_by_n_free))
         return free_nbytes // BLOCK_NBYTES
     
     def alloc_block_ids(self, n: int) -> List[int]:
         allocated_blocks: list[int] = []
         while (next_allocate_n := n - len(allocated_blocks)) > 0:
-            if len(self.pages_by_n_free) == 0:
+            if self.pages_by_n_free.empty():
                 n_pages = math.ceil((n - len(allocated_blocks)) / self.n_blocks_per_page)
                 self._new_page(n_pages)
             item = self.pages_by_n_free.pop()
-            if item.op_c != item.page.op_c: # invalid item
+            if item.op_c != item.page.op_c: # mark delete
                 continue
             page = item.page
             if page.n_free > next_allocate_n:
                 allocated_blocks.extend(page.alloc_block_ids(next_allocate_n))
                 item.n_free = page.n_free
-                self.pages_by_n_free.append(item)
+                self.pages_by_n_free.push(item)
             else:
                 allocated_blocks.extend(page.alloc_block_ids(page.n_free))
                 assert page.no_free, f"Page {page.page_id} is not empty: {page.n_free}"
-        self.num_blocks_in_used += n
-        self.num_blocks_free -= n
+        
         assert len(allocated_blocks) == n, f'Allocated {len(allocated_blocks)} blocks instead of {n}'
         return allocated_blocks
 
@@ -220,55 +224,53 @@ class PageManager:
             page = item.page
             page.free_block_ids([block_id])
             self._update_page(page)
-        self.num_blocks_in_used -= len(block_ids)
-        self.num_blocks_free += len(block_ids)
+
 
 @dataclass
 class LayerBlockMeta:
     block_id_by_layer: list[int]
 
-
-INVALID_MAPPING = -666
 class PerLayerBlockTranslator:
     def __init__(self, block_ids: list[int]):
-        self.block_id_by_blk_layer = torch.zeros((len(block_ids), 40), dtype=torch.int32) + INVALID_MAPPING
+        self.layer_meta = dict[BlockId, LayerBlockMeta]()
         self.available_block_ids = block_ids.copy()
         self.available_block_ids.remove(0)
         self.used_block_ids = set()
-        self.always_available_page_id = None
-        # print(f'availabe block ids {self.available_block_ids}')
+        print(f'availabe block ids {self.available_block_ids}')
     
     def put_block(self, per_layer_block_ids: list[int]) -> BlockId:
-        # print('put_block begin')
         block_id = self.available_block_ids.pop()
         # logger.info(f'Put block id {block_id}')
-        self.block_id_by_blk_layer[block_id] = torch.tensor(per_layer_block_ids, dtype=torch.int32)
+        assert block_id not in self.layer_meta
+        self.layer_meta[block_id] = LayerBlockMeta(per_layer_block_ids)
         # len1 = len(self.used_block_ids)
         # self.used_block_ids.update(per_layer_block_ids)
         # len2 = len(self.used_block_ids)
         # assert len1 + len(per_layer_block_ids) == len2
         assert block_id != 0
-        # print('put_block end')
         return block_id
     
     def get_block(self, block_id: BlockId, layer_idx: int) -> int:
-        raise NotImplementedError()
+        assert 0 <= block_id < 4096, f'Invalid block index {block_id}'
+        if block_id not in self.layer_meta:
+            raise ValueError(f'Block {block_id} not found')
+        blk_idx = self.layer_meta[block_id].block_id_by_layer[layer_idx]
+        # logger.info(f'get block {block_id} layer {layer_idx} -> {blk_idx}')
+        return blk_idx
     
-    def translate_slot_mapping(self, slot_mapping: int, layer_idx: int) -> int: 
-        raise NotImplementedError()
+    def translate_slot_mapping(self, slot_mapping: int, layer_idx: int) -> int:
+        # return slot_mapping
         if slot_mapping < 0:
             return slot_mapping
         assert 0 <= layer_idx < 40
         assert slot_mapping != 0
         blk_id = self.get_block(slot_mapping // 16, layer_idx)
-        # blk_id = self.always_available_page_id
         assert 0 <= blk_id < 4096 * 40, f'Invalid block index {blk_id}'
         new_slot_mapping = blk_id * 16 + (slot_mapping % 16)
         # logger.info(f'slot_mapping {slot_mapping} -> {new_slot_mapping}')
         return new_slot_mapping
 
     def translate_block_table(self, e: int, layer_idx: int) -> int:
-        raise NotImplementedError()
         if e <= 0:
             return e
         assert e != 0
@@ -277,16 +279,12 @@ class PerLayerBlockTranslator:
         assert 0 <= blk_id < 4096 * 40, f'Invalid block index {blk_id}'
         return blk_id
     
-    def pop_block(self, block_id: BlockId):
+    def pop_block(self, block_id: BlockId) -> LayerBlockMeta:
         self.available_block_ids.append(block_id)
-        ret = self.block_id_by_blk_layer[block_id].tolist()
-        self.block_id_by_blk_layer[block_id] = INVALID_MAPPING
-        return ret
-        # self.available_block_ids.append(block_id)
-        # # for blk_idx in self.layer_meta[block_id].block_id_by_layer:
-        # #     self.used_block_ids.remove(blk_idx)
-        # # logger.info(f'Pop block id {block_id}')
-        # return self.layer_meta.pop(block_id)
+        # for blk_idx in self.layer_meta[block_id].block_id_by_layer:
+        #     self.used_block_ids.remove(blk_idx)
+        # logger.info(f'Pop block id {block_id}')
+        return self.layer_meta.pop(block_id)
 
 class NaiveDynamicBlockAllocator(BlockAllocator):
 
@@ -326,32 +324,29 @@ class NaiveDynamicBlockAllocator(BlockAllocator):
         )
         builtins.colsys_allocator = self
         logger.info('Init NaiveDynamicBlockAllocator')
-        
     
-    # def translate_attention_metadata(self, layer_idx: int, attn_metadata: PagedAttentionMetadata) -> PagedAttentionMetadata:
-    #     return attn_metadata
-    #     t0 = time.time()
-    #     assert isinstance(attn_metadata, PagedAttentionMetadata)
-    #     # logger.info(f'slot mapping {attn_metadata.slot_mapping.tolist()}')
-    #     slot_mapping = torch.Tensor([
-    #         self.translator.translate_slot_mapping(slot.item(), layer_idx) for slot in attn_metadata.slot_mapping.cpu()
-    #     ]).to(dtype=attn_metadata.slot_mapping.dtype, device='cuda')
-    #     # logger.info(f'block_tables {attn_metadata.block_tables.tolist()}')
-    #     cpu_copy = attn_metadata.block_tables.cpu()
-    #     block_tables = torch.tensor([
-    #         [self.translator.translate_block_table(e.item(), layer_idx) for e in row]
-    #         for row in cpu_copy
-    #     ])
-    #     block_tables = block_tables.to(dtype=attn_metadata.block_tables.dtype, device='cuda')
-    #     from dataclasses import replace
-    #     attn_metadata = replace(
-    #         attn_metadata,
-    #         slot_mapping=slot_mapping,
-    #         block_tables=block_tables,
-    #     )
-    #     t1 = time.time()
-    #     print(f'translate_attention_metadata took {t1 - t0} seconds')
-    #     return attn_metadata
+    def translate_attention_metadata(self, layer_idx: int, attn_metadata: PagedAttentionMetadata) -> PagedAttentionMetadata:
+        assert isinstance(attn_metadata, PagedAttentionMetadata)
+        # logger.info(f'slot mapping {attn_metadata.slot_mapping.tolist()}')
+        # torch.cuda.synchronize()
+        slot_mapping = torch.Tensor([
+            self.translator.translate_slot_mapping(slot.item(), layer_idx) for slot in attn_metadata.slot_mapping.cpu()
+        ]).to(dtype=attn_metadata.slot_mapping.dtype, device=attn_metadata.slot_mapping.device)
+        # logger.info(f'block_tables {attn_metadata.block_tables.tolist()}')
+        # torch.cuda.synchronize()
+        cpu_copy = attn_metadata.block_tables.cpu()
+        block_tables = torch.tensor([
+            [self.translator.translate_block_table(e.item(), layer_idx) for e in row]
+            for row in cpu_copy
+        ])
+        block_tables = block_tables.to(dtype=attn_metadata.block_tables.dtype, device=attn_metadata.block_tables.device)
+        from dataclasses import replace
+        attn_metadata = replace(
+            attn_metadata,
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+        )
+        return attn_metadata
 
 
 
@@ -444,14 +439,8 @@ class NaiveDynamicBlockAllocator(BlockAllocator):
 
     def _allocate_new_block_id(self) -> BlockId:
         # logger.info(f'begin allocate new block id')
-        # t0 = time.time()
-        # llm_server.info("_allocate_new_block_id")
-        # logger.info('Alloc Block id Begin')
         per_layer_block_ids = self.page_manager.alloc_block_ids(self.n_layers)
-        # logger.info('Alloc Block id Done')
         block_id = self.translator.put_block(per_layer_block_ids)
-        # t1 = time.time()
-        # print(f'Allocate new block id {block_id} took {t1 - t0} seconds')
         self._refcounter.incr(block_id)
         # logger.info(f'end allocate new block id {block_id}')
         return block_id
@@ -459,7 +448,7 @@ class NaiveDynamicBlockAllocator(BlockAllocator):
     def _free_block_id(self, block_id: BlockId) -> None:
         refcount = self._refcounter.decr(block_id)
         if refcount == 0:
-            per_layer_block_ids = self.translator.pop_block(block_id)
+            per_layer_block_ids = self.translator.pop_block(block_id).block_id_by_layer
             self.page_manager.free_block_ids(per_layer_block_ids )                                                                                                                                                   
 
     @property

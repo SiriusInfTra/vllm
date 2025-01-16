@@ -420,6 +420,39 @@ def make_tensor_with_pad(
     return torch.tensor(padded_x, dtype=dtype, device=device)
 
 
+def pad_and_stack_3d_tensors(
+    tensors: List[torch.Tensor],
+    max_len: int,
+    pad: int,
+    dtype: torch.dtype,
+    feature_size: int,
+    device: Optional[Union[str, torch.device]] = None,
+) -> torch.Tensor:
+    """Pad and stack a list of 2D tensors into a 3D tensor.
+
+    Args:
+        tensors (List[torch.Tensor]): List of 2D tensors to pad and stack.
+        pad_value (int): Value to use for padding.
+        dtype (torch.dtype): Desired data type of the output tensor.
+        feature_size (int): The size of the second dimension of the tensors.
+        device (Optional[Union[str, torch.device]]): Device on which to place the output tensor.
+
+    Returns:
+        torch.Tensor: A 3D tensor with all input tensors padded to the same length.
+    """
+
+    
+    # Pad each tensor to the maximum length
+    padded_tensors = [
+        torch.cat((tensor, torch.full((max_len - tensor.size(0), feature_size), pad, dtype=tensor.dtype)))
+        if tensor.size(0) > 0 else torch.full((max_len, feature_size), pad, dtype=tensor.dtype)
+        for tensor in tensors
+    ]
+    
+    # Stack the padded tensors into a single 3D tensor
+    return torch.stack(padded_tensors).to(dtype=dtype, device=device)
+
+
 def async_tensor_h2d(
     data: list,
     dtype: torch.dtype,

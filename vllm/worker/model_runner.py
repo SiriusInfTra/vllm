@@ -1,6 +1,7 @@
+import builtins
 import contextlib
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, cast
 
 import numpy as np
 import torch
@@ -25,9 +26,26 @@ from vllm.sequence import (MultiModalData, SamplerOutput, SequenceData,
                            SequenceGroupMetadata)
 from vllm.utils import (CudaMemoryProfiler, async_tensor_h2d,
                         is_pin_memory_available, make_tensor_with_pad,
-                        maybe_expand_dim)
+                        maybe_expand_dim, pad_and_stack_3d_tensors)
 
 logger = init_logger(__name__)
+
+import time
+from functools import wraps
+
+
+import llm_server
+
+# def timing_decorator(func):
+#     @wraps(func)
+#     def wrapper(*args, **kwargs):
+#         start_time = time.time()  # 开始时间
+#         result = func(*args, **kwargs)  # 执行函数
+#         end_time = time.time()  # 结束时间
+#         execution_time = end_time - start_time  # 计算执行时间
+#         print(f"Function '{func.__name__}' executed in {execution_time:.4f} seconds")
+#         return result
+#     return wrapper
 
 _PAD_SLOT_ID = -1
 LORA_WARMUP_RANK = 8
@@ -89,6 +107,15 @@ class ModelRunner:
 
         self.attn_backend = get_attn_backend(
             self.model_config.dtype if model_config is not None else None)
+    
+        try:
+            import llm_server
+            if llm_server.use_kv_cache_pool():
+                self._prepare_prompt = self._prepare_prompt_colsys
+                self._prepare_decode = self._prepare_decode_colsys
+                logger.info(f'Using colsys _prepare_prompt and _prepare_decode')
+        except ImportError:
+            pass
 
     def load_model(self) -> None:
         with CudaMemoryProfiler() as m:
@@ -131,6 +158,7 @@ class ModelRunner:
         block_size = self.block_size
         return (self.max_context_len_to_capture + block_size - 1) // block_size
 
+    #timing_decorator
     def _prepare_prompt(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -334,6 +362,7 @@ class ModelRunner:
                 subquery_lens, lora_index_mapping, lora_prompt_mapping,
                 lora_requests, multi_modal_input)
 
+    #timing_decorator
     def _prepare_decode(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -464,6 +493,384 @@ class ModelRunner:
         )
         return (input_tokens, input_positions, attn_metadata,
                 lora_index_mapping, lora_prompt_mapping, lora_requests)
+
+
+    #timing_decorator
+    def _prepare_prompt_colsys(
+            self,
+            seq_group_metadata_list: List[SequenceGroupMetadata],
+        ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, List[int],
+                List[int], List[int], List[int], Set[LoRARequest],
+                torch.Tensor]:
+            assert len(seq_group_metadata_list) > 0
+            input_tokens: List[int] = []
+            input_positions: List[int] = []
+            slot_mapping: List[int] = []
+            lora_index_mapping: List[int] = []
+            lora_prompt_mapping: List[int] = []
+            lora_requests: Set[LoRARequest] = set()
+
+            prompt_lens: List[int] = []
+            context_lens: List[int] = []
+            subquery_lens: List[int] = []
+            prefix_block_tables: List[List[int]] = []
+            multi_modal_input_list: List[torch.Tensor] = []
+            from vllm.core.block.dynamic_block import NaiveDynamicBlockAllocator, INVALID_MAPPING
+            allocator = cast(NaiveDynamicBlockAllocator, builtins.colsys_allocator)
+            # logger.info('_prepare_prompt begin')
+            for seq_group_metadata in seq_group_metadata_list:
+                assert seq_group_metadata.is_prompt
+                seq_ids = list(seq_group_metadata.seq_data.keys())
+                assert len(seq_ids) == 1
+                seq_id = seq_ids[0]
+
+                computed_block_nums = seq_group_metadata.computed_block_nums
+                if (self.scheduler_config is not None
+                        and self.scheduler_config.chunked_prefill_enabled
+                        and computed_block_nums is not None):
+                    raise RuntimeError(
+                        "chunked prefill cannot be used with prefix caching "
+                        "now.")
+
+                token_chunk_size = seq_group_metadata.token_chunk_size
+                seq_data = seq_group_metadata.seq_data[seq_id]
+                computed_len = seq_data.get_num_computed_tokens()
+                # We should use get_len here because in case of preemption
+                # it contains output tokens.
+                prefill_end = min(seq_data.get_len(),
+                                computed_len + token_chunk_size)
+                # TODO(sang): Rename it after chunked prefill is introduced.
+                prompt_tokens = seq_data.get_token_ids()[computed_len:prefill_end]
+                prompt_len = len(prompt_tokens)
+                # Right now, the prefill_end is always same as the length of
+                # sequence. However, once chunked prefill is introduced, this
+                # assumption can be changed.
+                assert prefill_end == seq_data.get_len()
+                prompt_lens.append(prompt_len)
+
+                # NOTE: This only works for oooooooxxx style attention.
+                if computed_block_nums is not None and len(
+                        computed_block_nums) > 0 and self.sliding_window is None:
+                    # Prefix is not supported with sliding_window
+                    computed_len = len(computed_block_nums) * self.block_size
+                    prompt_tokens = prompt_tokens[computed_len:]
+                    # prefix_block_tables.append(computed_block_nums)
+                    prefix_block_tables.append(allocator.translator.block_id_by_blk_layer[computed_block_nums])
+                    raise NotImplementedError()
+                else:
+                    prefix_block_tables.append(torch.empty(0))
+                    # Right now, prefill start is always 0. However, this
+                    # assumption can be changed once chunked prefill is introduced.
+                    assert computed_len == 0
+
+                # actual prompt lens
+                context_lens.append(computed_len)
+                subquery_lens.append(prompt_len - computed_len)
+
+                input_tokens.extend(prompt_tokens)
+                # NOTE(woosuk): Here we assume that the first token in the prompt
+                # is always the first token in the sequence.
+                input_positions.extend(list(range(computed_len, prefill_end)))
+
+                lora_id = seq_group_metadata.lora_int_id
+
+                if lora_id > 0:
+                    lora_requests.add(seq_group_metadata.lora_request)
+
+                lora_index_mapping += [lora_id] * (prompt_len - computed_len)
+                lora_prompt_mapping.extend(
+                    [lora_id] *
+                    (prompt_len - computed_len
+                    if seq_group_metadata.sampling_params.prompt_logprobs else 1))
+
+                if seq_group_metadata.multi_modal_data:
+                    multi_modal_input_list.append(
+                        seq_group_metadata.multi_modal_data.data)
+
+                if seq_group_metadata.block_tables is None:
+                    # During memory profiling, the block tables are not initialized
+                    # yet. In this case, we just use a dummy slot mapping.
+                    slot_mapping.extend([_PAD_SLOT_ID] * prompt_len)
+                    continue
+
+                # Compute the slot mapping.
+                # (token_idx, ) -> vllm_blk_id
+                block_table = seq_group_metadata.block_tables[seq_id]
+                # (token_idx, layer_idx) -> blk_id
+                block_table = allocator.translator.block_id_by_blk_layer[block_table]
+                assert torch.all(block_table != INVALID_MAPPING)
+                # Mask the [0, start_idx) tokens of the prompt with _PAD_SLOT_ID,
+                # where start_idx is max(0, prompt_len - sliding_window).
+                # For example, if the prompt len is 10, sliding window is 8, and
+                # block size is 4, the first two tokens are masked and the slot
+                # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
+                start_idx = 0
+                if self.sliding_window is not None:
+                    assert computed_len == 0, (
+                        "Prefix caching is currently not supported with "
+                        "sliding window attention")
+                    start_idx = max(0, prompt_len - self.sliding_window)
+
+
+                for i in range(computed_len, prefill_end):
+                    if i < start_idx:
+                        slot_mapping.append(_PAD_SLOT_ID)
+                        continue
+                    # (layer_idx,) -> blk_id
+                    block_number = block_table[i // self.block_size]
+                    block_offset = i % self.block_size
+
+                    slot = block_number * self.block_size + block_offset
+                    slot_mapping.append(slot)
+
+            max_subquery_len = max(subquery_lens)
+            max_prompt_len = max(prompt_lens)
+            num_prompt_tokens = len(input_tokens)
+            assert max_subquery_len > 0
+
+            input_tokens = torch.tensor(input_tokens,
+                                        dtype=torch.long,
+                                        device=self.device)
+            input_positions = torch.tensor(input_positions,
+                                        dtype=torch.long,
+                                        device=self.device)
+            # (token_idx, layer_idx) -> blk_id
+            # print(slot_mapping)
+            slot_mapping: torch.Tensor = torch.vstack(slot_mapping)
+            slot_mapping = slot_mapping.transpose(1, 0).contiguous()
+            # transpose to (layer_idx, token_idx) -> blk, ensure continuous
+            slot_mapping = slot_mapping.to(dtype=torch.long, device=self.device)
+            # logger.info(f'slot_mapping shape {slot_mapping.shape}')
+            lora_index_mapping = lora_index_mapping
+
+            context_lens_tensor = torch.tensor(context_lens,
+                                            dtype=torch.int,
+                                            device=self.device)
+
+            if multi_modal_input_list:
+                assert self.vision_language_config, (
+                    "Multi-modal inputs are only supported by "
+                    "vision language models.")
+                multi_modal_input = torch.cat(multi_modal_input_list,
+                                            dim=0).to(self.device)
+            else:
+                multi_modal_input = None
+
+            # Prepare prefix block tables
+            max_prompt_block_table_len = max(len(t) for t in prefix_block_tables)
+            # logger.info(f'prefix_block_tables {prefix_block_tables}')
+            block_tables: torch.Tensor = pad_and_stack_3d_tensors(
+                prefix_block_tables,
+                max_len=max_prompt_block_table_len,
+                pad=0,
+                dtype=torch.int,
+                feature_size=40,
+            )
+            # (layer_idx, batch_idx, local_blk_id) -> blk_id
+            block_tables = block_tables.permute(2, 0, 1).contiguous()
+
+
+            # Query length can be shorter than key (i.e., prompt) when prefill
+            # is chunked or prefix cached.
+            subquery_lens_tensor = torch.tensor(subquery_lens,
+                                                dtype=torch.long,
+                                                device=self.device)
+            subquery_start_loc = torch.zeros(subquery_lens_tensor.shape[0] + 1,
+                                            dtype=torch.int32,
+                                            device=self.device)
+
+            prompt_lens_tensor = torch.tensor(prompt_lens,
+                                            dtype=torch.long,
+                                            device=self.device)
+            seq_start_loc = torch.zeros(prompt_lens_tensor.shape[0] + 1,
+                                        dtype=torch.int32,
+                                        device=self.device)
+
+            torch.cumsum(subquery_lens_tensor,
+                        dim=0,
+                        dtype=subquery_start_loc.dtype,
+                        out=subquery_start_loc[1:])
+
+            torch.cumsum(prompt_lens_tensor,
+                        dim=0,
+                        dtype=seq_start_loc.dtype,
+                        out=seq_start_loc[1:])
+            # logger.info(f'block_tables shape {block_tables.shape}')
+            attn_metadata = self.attn_backend.make_metadata(
+                is_prompt=True,
+                slot_mapping=slot_mapping,
+                prompt_lens=prompt_lens,
+                prompt_lens_tensor=prompt_lens_tensor,
+                num_prompt_tokens=num_prompt_tokens,
+                num_generation_tokens=0,
+                max_subquery_len=max_subquery_len,
+                max_context_len=None,
+                max_prompt_len=max_prompt_len,
+                subquery_start_loc=subquery_start_loc,
+                seq_start_loc=seq_start_loc,
+                context_lens=context_lens_tensor,
+                block_tables=torch.empty(0),
+                use_cuda_graph=False,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+            # print('_prepare_prompt end')
+            return (input_tokens, input_positions, attn_metadata, prompt_lens,
+                    subquery_lens, lora_index_mapping, lora_prompt_mapping,
+                    lora_requests, multi_modal_input)
+
+    #timing_decorator
+    def _prepare_decode_colsys(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+    ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, List[int],
+               List[int], Set[LoRARequest]]:
+        assert len(seq_group_metadata_list) > 0
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
+        slot_mapping: List[int] = []
+        context_lens: List[int] = []
+        block_tables: List[List[int]] = []
+        lora_index_mapping: List[int] = []
+        lora_prompt_mapping: List[int] = []
+        lora_requests: Set[LoRARequest] = set()
+        from vllm.core.block.dynamic_block import NaiveDynamicBlockAllocator, INVALID_MAPPING
+        allocator = cast(NaiveDynamicBlockAllocator, builtins.colsys_allocator)
+        for seq_group_metadata in seq_group_metadata_list:
+            assert not seq_group_metadata.is_prompt
+            assert seq_group_metadata.token_chunk_size == 1
+
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            lora_id = seq_group_metadata.lora_int_id
+
+            if lora_id > 0:
+                lora_requests.add(seq_group_metadata.lora_request)
+
+            for seq_id in seq_ids:
+                seq_data = seq_group_metadata.seq_data[seq_id]
+                generation_token = seq_data.get_last_token_id()
+                input_tokens.append(generation_token)
+
+                seq_len = seq_data.get_len()
+                position = seq_len - 1
+                input_positions.append(position)
+
+                context_len = seq_len if self.sliding_window is None else min(
+                    seq_len, self.sliding_window)
+                context_lens.append(context_len)
+
+                # (token_idx,) -> vllm_blk_id
+                block_table = seq_group_metadata.block_tables[seq_id]
+                # logger.info(f'!!block_table1 {len(block_table)}')
+                # (token_idx, layer_idx) -> blk_id ?????????????????
+                block_table = allocator.translator.block_id_by_blk_layer[block_table]
+                # logger.info(f'!!block_table2 {block_table.shape}')
+                # assert torch.all(block_table != INVALID_MAPPING)
+                # (layer_idx,) -> blk_id
+                block_number = block_table[position // self.block_size]
+                block_offset = position % self.block_size
+                slot = block_number * self.block_size + block_offset
+                slot_mapping.append(slot)
+                lora_index_mapping.append(lora_id)
+                lora_prompt_mapping.append(lora_id)
+
+                if self.sliding_window is not None:
+                    sliding_window_blocks = (self.sliding_window //
+                                             self.block_size)
+                    block_table = block_table[-sliding_window_blocks:]
+                block_tables.append(block_table)
+
+        # vLLM uses cuda graph only for decoding requests.
+        # See `capture_model` API for more details.
+        # For decoding requests, batch_size == input_tokens.
+        batch_size = len(input_tokens)
+        max_context_len = max(context_lens)
+        use_captured_graph = (
+            not self.model_config.enforce_eager
+            and batch_size <= _BATCH_SIZES_TO_CAPTURE[-1]
+            and max_context_len <= self.max_context_len_to_capture)
+        if use_captured_graph:
+            raise NotImplementedError()
+            graph_batch_size = _get_graph_batch_size(batch_size)
+            assert graph_batch_size >= batch_size
+            for _ in range(graph_batch_size - batch_size):
+                input_tokens.append(0)
+                input_positions.append(0)
+                slot_mapping.append(torch.zeros_like(allocator.translator.block_id_by_blk_layer[0]) + _PAD_SLOT_ID)
+                context_lens.append(1)
+                block_tables.append([])
+                lora_index_mapping.append(0)
+            batch_size = graph_batch_size
+        
+        # (token_idx, layer_idx) -> blk_id
+        slot_mapping: torch.Tensor = torch.vstack(slot_mapping)
+        # transpose to (layer_idx, token_idx) -> blk, ensure continuous
+        slot_mapping = slot_mapping.transpose(1, 0).contiguous()
+        # logger.info(f'slot_mapping shape {slot_mapping.shape}')
+                                    
+
+        input_tokens = torch.tensor(input_tokens,
+                                    dtype=torch.long,
+                                    device=self.device)
+        input_positions = torch.tensor(input_positions,
+                                       dtype=torch.long,
+                                       device=self.device)
+        slot_mapping = slot_mapping.to(dtype=torch.long, device=self.device)
+        
+        context_lens = torch.tensor(context_lens,
+                                    dtype=torch.int,
+                                    device=self.device)
+
+        if use_captured_graph:
+            # When using cuda-graph all these tensors should be
+            # padded.
+            assert context_lens.shape[0] == input_tokens.shape[0]
+            assert context_lens.shape[0] == input_positions.shape[0]
+            assert context_lens.shape[0] == slot_mapping.shape[0]
+
+            # The shape of graph_block_tables is
+            # [max batch size, max context len // block size].
+            input_block_tables = self.graph_block_tables[:batch_size]
+            for i, block_table in enumerate(block_tables):
+                if block_table:
+                    input_block_tables[i, :len(block_table)] = block_table
+            block_tables = torch.tensor(input_block_tables, device=self.device)
+            raise NotImplementedError()
+        else:
+            max_block_table_len = max(
+                len(block_table) for block_table in block_tables)
+            # (batch_idx, local_blk_id, layer_idx) -> blk_id
+            block_tables: torch.Tensor = pad_and_stack_3d_tensors(
+                block_tables,
+                max_len=max_block_table_len,
+                pad=0,
+                dtype=torch.int,
+                feature_size=40,
+            )
+            # (layer_idx, batch_idx, local_blk_id) -> blk_id
+            block_tables = block_tables.permute(2, 0, 1).contiguous()
+        
+        block_tables = block_tables.to(device=self.device)
+        # logger.info(f'block_tables shape {block_tables.shape}')
+        attn_metadata = self.attn_backend.make_metadata(
+            is_prompt=False,
+            slot_mapping=slot_mapping,
+            prompt_lens=None,
+            prompt_lens_tensor=None,
+            num_prompt_tokens=0,
+            num_generation_tokens=len(input_tokens),
+            max_subquery_len=None,
+            max_context_len=max_context_len,
+            max_prompt_len=None,
+            subquery_start_loc=None,
+            seq_start_loc=None,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            use_cuda_graph=use_captured_graph,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
+        return (input_tokens, input_positions, attn_metadata,
+                lora_index_mapping, lora_prompt_mapping, lora_requests)
+
 
     def _prepare_sample(
         self,
@@ -668,12 +1075,13 @@ class ModelRunner:
         # Only perform sampling in the driver worker.
         if not sampling_metadata.perform_sampling:
             return None
-
         # Sample the next token.
         output = self.model.sample(
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
+        llm_server.set_num_required_tpc(0)
+
         return output
 
     @torch.inference_mode()

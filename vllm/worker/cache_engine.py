@@ -65,7 +65,14 @@ class CacheEngine:
             try:
                 import llm_server
                 use_llm_server_kv_cache_pool = llm_server.use_kv_cache_pool()
-                logger.info(f'Using llm_server KV cache pool, block shape {kv_cache_shape}')
+                if use_llm_server_kv_cache_pool:
+                    llm_kv_cache: torch.Tensor = llm_server.init_kv_cache(
+                        self.num_layers,
+                        list(kv_cache_shape),
+                        str(self.dtype),
+                        self.dtype.itemsize,
+                    )
+                    logger.info(f'Using llm_server KV cache pool, block shape {kv_cache_shape}')
             except ImportError:
                 pass
 
@@ -77,13 +84,14 @@ class CacheEngine:
                                 pin_memory=pin_memory,
                                 device=device))
             else:
-                _kv_cache_ts: torch.Tensor = llm_server.init_kv_cache(
-                    layer_idx,
-                    list(kv_cache_shape),
-                    str(self.dtype),
-                    self.dtype.itemsize,
+                
+                _kv_cache_ts: torch.Tensor = llm_kv_cache
+                logger.info(f'shape!!!!!!!!!!!!!!!!!!!!!!!! {llm_kv_cache.shape}')
+                _kv_cache_ts = _kv_cache_ts.as_strided(
+                    size=[2, 4096 * 40, 81920],
+                    stride=[81920, 81920 * 2  , 1]
                 )
-                # logger.info(f'layer {layer_idx} block shape {list(kv_cache_shape)} dtype {self.dtype} | ts shape {_kv_cache_ts.shape} dtype {_kv_cache_ts.dtype}')
+                logger.info(f'layer {layer_idx} block shape {list(_kv_cache_ts.shape)} | {_kv_cache_ts.stride()} dtype {self.dtype} | ts shape {_kv_cache_ts.shape} dtype {_kv_cache_ts.dtype}')
                 kv_cache.append(_kv_cache_ts)
         return kv_cache
 

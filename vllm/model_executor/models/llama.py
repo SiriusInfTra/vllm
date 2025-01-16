@@ -21,7 +21,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
-from typing import Any, Dict, List, Optional, Tuple
+import builtins
+from dataclasses import replace
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
 from torch import nn
@@ -29,6 +33,8 @@ from transformers import LlamaConfig
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import LoRAConfig
+
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
@@ -47,6 +53,54 @@ from vllm.model_executor.weight_utils import (default_weight_loader,
                                               hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
 
+logger = init_logger(__name__)
+
+def get_policy():
+    from scipy.interpolate import interp1d
+    num_batched_tokens_list = [128, 2048]
+    target_num_tpc_list     = [30,  45]
+    linear_interp_prompt = interp1d(
+        num_batched_tokens_list, 
+        target_num_tpc_list, 
+        kind='linear', 
+        fill_value=(target_num_tpc_list[0], target_num_tpc_list[-1]),
+        bounds_error=False
+    )
+    num_batched_tokens_list = [1,  128]
+    target_num_tpc_list     = [10, 18]
+    linear_interp_decode = interp1d(
+        num_batched_tokens_list, 
+        target_num_tpc_list, 
+        kind='linear', 
+        fill_value=(target_num_tpc_list[0], target_num_tpc_list[-1]),
+        bounds_error=False
+    )
+
+    def tpc_policy(is_prompt: bool, num_batched_tokens: int):
+        # return 54
+        if is_prompt:
+            out = linear_interp_prompt(num_batched_tokens).item()
+        else:
+            out = linear_interp_decode(num_batched_tokens).item()
+        return round(out)
+    return tpc_policy
+try:
+    import llm_server
+    _COLSYS_TPC = int(os.environ['COLSYS_VLLM_TPC'])
+    llm_server.info_with_frame(f'COLSYS_VLLM_TPC: {_COLSYS_TPC}')
+    assert -1 <= _COLSYS_TPC <= 54
+    if _COLSYS_TPC == -1:
+        _COLSYS_TPC_POLICY = get_policy()
+except Exception as e:
+    if isinstance(e, ImportError):
+        pass
+    else:
+        logger.info(f'No TPC Set.')
+    _COLSYS_TPC = -2
+# -2 -> DISABLED
+# -1 -> USE_POLICY
+#  0 -> UNSET
+# >0 -> USE TPC
 
 class LlamaMLP(nn.Module):
 
@@ -162,10 +216,12 @@ class LlamaDecoderLayer(nn.Module):
 
     def __init__(
         self,
+        layer_idx: int,
         config: LlamaConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -203,7 +259,26 @@ class LlamaDecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
+        # t0 = time.time()
+        block_tables: torch.Tensor = attn_metadata.block_tables
+        slot_mapping: torch.Tensor = attn_metadata.slot_mapping
+
+        if block_tables.ndim == 3:
+            block_tables = block_tables[self.layer_idx, :, :]
+
+        if slot_mapping.ndim == 2:
+            slot_mapping = slot_mapping[self.layer_idx, :]
+
+        attn_metadata = replace(
+            attn_metadata,
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+        )
+        # t1 = time.time()
+        # print(f'translate cost {t1 - t0}')
+
+        # assert attn_metadata.block_tables.is_contiguous()
+        # assert attn_metadata.slot_mapping.is_contiguous()
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -245,8 +320,8 @@ class LlamaModel(nn.Module):
             org_num_embeddings=config.vocab_size,
         )
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, linear_method)
-            for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(layer_idx, config, linear_method)
+            for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -342,8 +417,36 @@ class LlamaForCausalLM(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        from vllm.attention.backends.xformers import XFormersMetadata
+        assert isinstance(attn_metadata, XFormersMetadata)
+        prompt_run = attn_metadata.is_prompt
+        num_batched_tokens = attn_metadata.num_prompt_tokens if attn_metadata.is_prompt else attn_metadata.num_generation_tokens
+        if _COLSYS_TPC <= -2:
+            pass
+        elif _COLSYS_TPC == -1:
+            target_tpc = _COLSYS_TPC_POLICY(
+                prompt_run, 
+                num_batched_tokens
+            )
+            llm_server.set_num_required_tpc(target_tpc)
+        else:
+            logger.info(f'prompt_run: {prompt_run}')
+            logger.info(f'num_batched_tokens: {num_batched_tokens}')
+            logger.info(f'target_tpc: {_COLSYS_TPC}')
+            if _COLSYS_TPC > 0:
+                llm_server.set_num_available_tpc(_COLSYS_TPC, torch.cuda.current_stream().cuda_stream)
+            t0 = time.time()
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata)
+        # if _COLSYS_TPC <= -2:
+        #     pass
+        # elif _COLSYS_TPC == -1:
+        #     llm_server.set_num_required_tpc(0)
+        # else:
+        #     llm_server.set_num_available_tpc(54, torch.cuda.current_stream().cuda_stream)
+        #     t1 = time.time()
+        #     logger.info(f'execute_model time: {t1 - t0}')
+        #     logger.info(f'TPC_PERF: {1 if prompt_run else 0} {num_batched_tokens} {_COLSYS_TPC} {t1 - t0}')
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,

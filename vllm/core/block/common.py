@@ -26,7 +26,7 @@ class RefCounter:
                                            for index in deduped}
 
     def incr(self, block_id: BlockId) -> RefCount:
-        assert block_id in self._refcounts
+        assert block_id in self._refcounts, f'Block {block_id} not found'
         pre_incr_refcount = self._refcounts[block_id]
 
         assert pre_incr_refcount >= 0

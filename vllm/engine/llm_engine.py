@@ -1,6 +1,7 @@
 import time
 from typing import Iterable, List, Optional, Tuple, Type, Union
 
+import torch
 from transformers import PreTrainedTokenizer
 
 import vllm
@@ -25,6 +26,8 @@ from vllm.transformers_utils.tokenizer_group import (BaseTokenizerGroup,
 from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import Counter
+import time
+import os
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -154,7 +157,6 @@ class LLMEngine:
         # NOTE: the cache_config here have been updated with the numbers of
         # GPU and CPU blocks, which are profiled in the distributed executor.
         self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
-
         # Metric Logging.
         if self.log_stats:
             self.stat_logger = StatLogger(
@@ -667,7 +669,6 @@ class LLMEngine:
             >>>         break
         """
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
-
         if not scheduler_outputs.is_empty():
             output = self.model_executor.execute_model(
                 seq_group_metadata_list, scheduler_outputs.blocks_to_swap_in,

@@ -128,6 +128,20 @@ class Worker:
         # cache blocks that can be allocated with the remaining free memory.
         torch.cuda.empty_cache()
 
+
+        try:
+            import llm_server
+            cache_block_size = self.get_cache_block_size_bytes(block_size, cache_dtype)
+            num_gpu_blocks = llm_server.get_num_gpu_kv_cache_blocks()
+            num_cpu_blocks = int(cpu_swap_space // cache_block_size)
+            num_cpu_blocks = max(num_cpu_blocks, 0)
+            logger.info(f'using llm_server to determine gpu_blocks, '
+                        f'total_gpu_blocks_memory: {num_gpu_blocks * cache_block_size / 1024 / 1024} MiB, '
+                        f' num_gpu_blocks: {num_gpu_blocks}, num_cpu_blocks: {num_cpu_blocks}')
+            return num_gpu_blocks, num_cpu_blocks
+        except ImportError:
+            pass
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         self.model_runner.profile_run()
@@ -156,15 +170,7 @@ class Worker:
         gc.collect()
         torch.cuda.empty_cache()
 
-        try:
-            import llm_server
-            num_gpu_blocks = llm_server.get_num_gpu_kv_cache_blocks()
-            logger.info(f'using llm_server to determine gpu_blocks, '
-                        f'total_gpu_blocks_memory: {num_gpu_blocks * cache_block_size / 1024 / 1024} MiB, '
-                        f' num_gpu_blocks: {num_gpu_blocks}, num_cpu_blocks: {num_cpu_blocks}')
-            return num_gpu_blocks, num_cpu_blocks
-        except ImportError:
-            pass
+
 
         logger.info(f'total_gpu_memory: {total_gpu_memory / 1024 / 1024} MiB, gpu_mem_util {gpu_memory_utilization}, '
                     f'init_gpu_memory {self.init_gpu_memory / 1024 / 1024} MiB, peak_memory: {peak_memory / 1024 / 1024} MiB, '
