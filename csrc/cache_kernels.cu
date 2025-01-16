@@ -160,6 +160,8 @@ __global__ void reshape_and_cache_kernel(
   const int64_t* __restrict__ slot_mapping,   // [num_tokens]
   const int key_stride,
   const int value_stride,
+  const int key_cache_stride,
+  const int value_cache_stride,
   const int num_heads,
   const int head_size,
   const int block_size,
@@ -184,12 +186,14 @@ __global__ void reshape_and_cache_kernel(
     const int x_idx = head_offset / x;
     const int x_offset = head_offset % x;
 
-    const int64_t tgt_key_idx = block_idx * num_heads * (head_size / x) * block_size * x
+    const int64_t tgt_key_idx = // block_idx * num_heads * (head_size / x) * block_size * x
+                                key_cache_stride * block_idx
                                 + head_idx * (head_size / x) * block_size * x
                                 + x_idx * block_size * x
                                 + block_offset * x
                                 + x_offset;
-    const int64_t tgt_value_idx = block_idx * num_heads * head_size * block_size
+    const int64_t tgt_value_idx = // block_idx * num_heads * head_size * block_size
+                                  value_cache_stride * block_idx
                                   + head_idx * head_size * block_size
                                   + head_offset * block_size
                                   + block_offset;
@@ -220,6 +224,8 @@ __global__ void reshape_and_cache_kernel(
     slot_mapping.data_ptr<int64_t>(),                                                              \
     key_stride,                                                                                    \
     value_stride,                                                                                  \
+    key_cache_stride,                                                                              \
+    value_cache_stride,                                                                            \
     num_heads,                                                                                     \
     head_size,                                                                                     \
     block_size,                                                                                    \
@@ -241,6 +247,11 @@ void reshape_and_cache(
 
   int key_stride = key.stride(0);
   int value_stride = value.stride(0);
+
+  int key_cache_stride = key_cache.stride(0);
+  int value_cache_stride = value_cache.stride(0);
+  TORCH_CHECK(key_cache_stride == value_cache_stride,
+      "K,V cache stride[0] err", key_cache_stride, value_cache_stride);
 
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 512));
