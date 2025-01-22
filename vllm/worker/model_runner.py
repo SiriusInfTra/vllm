@@ -33,8 +33,11 @@ logger = init_logger(__name__)
 import time
 from functools import wraps
 
-
-import llm_server
+try:
+    import llm_server
+    from vllm import sm_partition
+except ImportError:
+    pass
 
 # def timing_decorator(func):
 #     @wraps(func)
@@ -1067,6 +1070,27 @@ class ModelRunner:
         }
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
+
+        if sm_partition._enable_dynamic_sm_partition:
+            prompt_run = attn_metadata.is_prompt
+            if attn_metadata.is_prompt:
+                num_batched_tokens = attn_metadata.num_prompt_tokens
+            else:
+                num_batched_tokens = attn_metadata.num_generation_tokens    
+
+            if sm_partition._COLSYS_TPC > 0:
+                llm_server.set_num_available_tpc(
+                    sm_partition._COLSYS_TPC, 
+                    torch.cuda.current_stream().cuda_stream)
+                execute_begin = time.time()
+            else:
+                target_tpc = sm_partition._COLSYS_TPC_POLICY(
+                    is_prompt=prompt_run,
+                    num_batched_tokens=num_batched_tokens,
+                )
+                llm_server.set_num_required_tpc(target_tpc)
+                execute_begin = None
+
         hidden_states = model_executable(**execute_model_kwargs)
 
         # Compute the logits.
@@ -1080,7 +1104,19 @@ class ModelRunner:
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
-        llm_server.set_num_required_tpc(0)
+
+        if sm_partition._enable_dynamic_sm_partition:
+            if sm_partition._COLSYS_TPC > 0:
+                llm_server.set_num_available_tpc(
+                    sm_partition.num_tot_tpc(), 
+                    torch.cuda.current_stream().cuda_stream
+                )
+                execute_end = time.time()
+                execute_time = execute_end - execute_begin
+                logger.info(
+                    f'TPC_PERF: {1 if prompt_run else 0} {num_batched_tokens} {sm_partition._COLSYS_TPC} {execute_time}')
+            else:
+                llm_server.set_num_required_tpc(0)
 
         return output
 

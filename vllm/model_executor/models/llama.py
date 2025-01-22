@@ -419,34 +419,8 @@ class LlamaForCausalLM(nn.Module):
     ) -> torch.Tensor:
         from vllm.attention.backends.xformers import XFormersMetadata
         assert isinstance(attn_metadata, XFormersMetadata)
-        prompt_run = attn_metadata.is_prompt
-        num_batched_tokens = attn_metadata.num_prompt_tokens if attn_metadata.is_prompt else attn_metadata.num_generation_tokens
-        if _COLSYS_TPC <= -2:
-            pass
-        elif _COLSYS_TPC == -1:
-            target_tpc = _COLSYS_TPC_POLICY(
-                prompt_run, 
-                num_batched_tokens
-            )
-            llm_server.set_num_required_tpc(target_tpc)
-        else:
-            logger.info(f'prompt_run: {prompt_run}')
-            logger.info(f'num_batched_tokens: {num_batched_tokens}')
-            logger.info(f'target_tpc: {_COLSYS_TPC}')
-            if _COLSYS_TPC > 0:
-                llm_server.set_num_available_tpc(_COLSYS_TPC, torch.cuda.current_stream().cuda_stream)
-            t0 = time.time()
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata)
-        # if _COLSYS_TPC <= -2:
-        #     pass
-        # elif _COLSYS_TPC == -1:
-        #     llm_server.set_num_required_tpc(0)
-        # else:
-        #     llm_server.set_num_available_tpc(54, torch.cuda.current_stream().cuda_stream)
-        #     t1 = time.time()
-        #     logger.info(f'execute_model time: {t1 - t0}')
-        #     logger.info(f'TPC_PERF: {1 if prompt_run else 0} {num_batched_tokens} {_COLSYS_TPC} {t1 - t0}')
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
