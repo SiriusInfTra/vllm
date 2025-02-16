@@ -222,17 +222,8 @@ class StatLogger:
 
             kv_cache_pool_info = ""
             if _use_llm_server_kv_cache_pool:
-                kv_cache_pool_stat = llm_server.get_kv_cache_pool_stat()
-                if kv_cache_pool_stat.num_allocated_blk_grps == 0:
-                    mem_page_util = "Nan"
-                else:
-                    mem_page_util = "{:.2f}".format(
-                        1 - kv_cache_pool_stat.num_idle_blk_grps / kv_cache_pool_stat.num_allocated_blk_grps)
-                kv_cache_pool_info = ", KVCacheMemPageUtil {}({}/{})".format(
-                    mem_page_util, 
-                    kv_cache_pool_stat.num_allocated_blk_grps - kv_cache_pool_stat.num_idle_blk_grps,
-                    kv_cache_pool_stat.num_allocated_blk_grps
-                )
+                kv_cache_pool_util = llm_server.get_kv_cache_pool_util()
+                kv_cache_pool_info += f', KVCachePoolUtil {100 * kv_cache_pool_util:.1f}%'  
 
             # Log to stdout.
             logger.info(
