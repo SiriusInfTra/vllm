@@ -86,17 +86,17 @@ def get_policy():
     return tpc_policy
 try:
     import llm_server
-    _COLSYS_TPC = int(os.environ['COLSYS_VLLM_TPC'])
-    llm_server.info_with_frame(f'COLSYS_VLLM_TPC: {_COLSYS_TPC}')
-    assert -1 <= _COLSYS_TPC <= 54
-    if _COLSYS_TPC == -1:
-        _COLSYS_TPC_POLICY = get_policy()
+    _SIRIUS_TPC = int(os.environ['SIRIUS_VLLM_TPC'])
+    llm_server.info_with_frame(f'SIRIUS_VLLM_TPC: {_SIRIUS_TPC}')
+    assert -1 <= _SIRIUS_TPC <= 54
+    if _SIRIUS_TPC == -1:
+        _SIRIUS_TPC_POLICY = get_policy()
 except Exception as e:
     if isinstance(e, ImportError):
         pass
     else:
         logger.info(f'No TPC Set.')
-    _COLSYS_TPC = -2
+    _SIRIUS_TPC = -2
 # -2 -> DISABLED
 # -1 -> USE_POLICY
 #  0 -> UNSET

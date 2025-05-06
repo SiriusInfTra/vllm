@@ -45,24 +45,24 @@ def get_policy():
 
 if _enable_dynamic_sm_partition:
     import llm_server
-    if 'COLSYS_VLLM_TPC' in os.environ:
-        _COLSYS_TPC = int(os.environ['COLSYS_VLLM_TPC'])
+    if 'SIRIUS_VLLM_TPC' in os.environ:
+        _SIRIUS_TPC = int(os.environ['SIRIUS_VLLM_TPC'])
     else:
-        _COLSYS_TPC = -1
-    llm_server.info_with_frame(f'COLSYS_VLLM_TPC: {_COLSYS_TPC}')
-    assert -1 <= _COLSYS_TPC <= 54
-    assert _COLSYS_TPC != 0, "COLSYS_VLLM_TPC must not be 0."
+        _SIRIUS_TPC = -1
+    llm_server.info_with_frame(f'SIRIUS_VLLM_TPC: {_SIRIUS_TPC}')
+    assert -1 <= _SIRIUS_TPC <= 54
+    assert _SIRIUS_TPC != 0, "SIRIUS_VLLM_TPC must not be 0."
 
-    if _COLSYS_TPC == -1:
-        _COLSYS_TPC_POLICY = get_policy()
+    if _SIRIUS_TPC == -1:
+        _SIRIUS_TPC_POLICY = get_policy()
     else:
-        llm_server.info_with_frame(f'Using fixed TPC: {_COLSYS_TPC} to profile the model.')
+        llm_server.info_with_frame(f'Using fixed TPC: {_SIRIUS_TPC} to profile the model.')
         def _tpc_policy(is_prompt: bool, num_batched_tokens: int):
-            return _COLSYS_TPC
-        _COLSYS_TPC_POLICY = _tpc_policy
+            return _SIRIUS_TPC
+        _SIRIUS_TPC_POLICY = _tpc_policy
 else:
     llm_server.info(f'No TPC Set.')
-    _COLSYS_TPC = -2 # deprecated
+    _SIRIUS_TPC = -2 # deprecated
 
 # -2 -> DISABLED
 # -1 -> USE_POLICY

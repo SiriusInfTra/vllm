@@ -322,7 +322,7 @@ class NaiveDynamicBlockAllocator(BlockAllocator):
             refcounter=self._refcounter.as_readonly(),
             allocator=self,
         )
-        builtins.colsys_allocator = self
+        builtins.sirius_allocator = self
         logger.info('Init NaiveDynamicBlockAllocator')
     
     def translate_attention_metadata(self, layer_idx: int, attn_metadata: PagedAttentionMetadata) -> PagedAttentionMetadata:

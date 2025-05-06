@@ -114,9 +114,9 @@ class ModelRunner:
         try:
             import llm_server
             if llm_server.use_kv_cache_pool():
-                self._prepare_prompt = self._prepare_prompt_colsys
-                self._prepare_decode = self._prepare_decode_colsys
-                logger.info(f'Using colsys _prepare_prompt and _prepare_decode')
+                self._prepare_prompt = self._prepare_prompt_sirius
+                self._prepare_decode = self._prepare_decode_sirius
+                logger.info(f'Using sirius _prepare_prompt and _prepare_decode')
         except ImportError:
             pass
 
@@ -499,7 +499,7 @@ class ModelRunner:
 
 
     #timing_decorator
-    def _prepare_prompt_colsys(
+    def _prepare_prompt_sirius(
             self,
             seq_group_metadata_list: List[SequenceGroupMetadata],
         ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, List[int],
@@ -519,7 +519,7 @@ class ModelRunner:
             prefix_block_tables: List[List[int]] = []
             multi_modal_input_list: List[torch.Tensor] = []
             from vllm.core.block.dynamic_block import NaiveDynamicBlockAllocator, INVALID_MAPPING
-            allocator = cast(NaiveDynamicBlockAllocator, builtins.colsys_allocator)
+            allocator = cast(NaiveDynamicBlockAllocator, builtins.sirius_allocator)
             # logger.info('_prepare_prompt begin')
             for seq_group_metadata in seq_group_metadata_list:
                 assert seq_group_metadata.is_prompt
@@ -722,7 +722,7 @@ class ModelRunner:
                     lora_requests, multi_modal_input)
 
     #timing_decorator
-    def _prepare_decode_colsys(
+    def _prepare_decode_sirius(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, List[int],
@@ -737,7 +737,7 @@ class ModelRunner:
         lora_prompt_mapping: List[int] = []
         lora_requests: Set[LoRARequest] = set()
         from vllm.core.block.dynamic_block import NaiveDynamicBlockAllocator, INVALID_MAPPING
-        allocator = cast(NaiveDynamicBlockAllocator, builtins.colsys_allocator)
+        allocator = cast(NaiveDynamicBlockAllocator, builtins.sirius_allocator)
         for seq_group_metadata in seq_group_metadata_list:
             assert not seq_group_metadata.is_prompt
             assert seq_group_metadata.token_chunk_size == 1
@@ -1078,13 +1078,13 @@ class ModelRunner:
             else:
                 num_batched_tokens = attn_metadata.num_generation_tokens    
 
-            if sm_partition._COLSYS_TPC > 0:
+            if sm_partition._SIRIUS_TPC > 0:
                 llm_server.set_num_available_tpc(
-                    sm_partition._COLSYS_TPC, 
+                    sm_partition._SIRIUS_TPC, 
                     torch.cuda.current_stream().cuda_stream)
                 execute_begin = time.time()
             else:
-                target_tpc = sm_partition._COLSYS_TPC_POLICY(
+                target_tpc = sm_partition._SIRIUS_TPC_POLICY(
                     is_prompt=prompt_run,
                     num_batched_tokens=num_batched_tokens,
                 )
@@ -1106,7 +1106,7 @@ class ModelRunner:
         )
 
         if sm_partition._enable_dynamic_sm_partition:
-            if sm_partition._COLSYS_TPC > 0:
+            if sm_partition._SIRIUS_TPC > 0:
                 llm_server.set_num_available_tpc(
                     sm_partition.num_tot_tpc(), 
                     torch.cuda.current_stream().cuda_stream
@@ -1114,7 +1114,7 @@ class ModelRunner:
                 execute_end = time.time()
                 execute_time = execute_end - execute_begin
                 logger.info(
-                    f'TPC_PERF: {1 if prompt_run else 0} {num_batched_tokens} {sm_partition._COLSYS_TPC} {execute_time}')
+                    f'TPC_PERF: {1 if prompt_run else 0} {num_batched_tokens} {sm_partition._SIRIUS_TPC} {execute_time}')
             else:
                 llm_server.set_num_required_tpc(0)
 
