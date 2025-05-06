@@ -1,5 +1,5 @@
-cmake>=3.21
-ninja  # For faster builds.
+# cmake>=3.21
+# ninja  # For faster builds.
 typing-extensions>=4.8.0
 starlette
 requests
@@ -14,4 +14,4 @@ fastapi
 uvicorn[standard]
 pydantic >= 2.0  # Required for OpenAI server.
 prometheus_client >= 0.18.0
-outlines == 0.0.34
+# outlines == 0.0.34
