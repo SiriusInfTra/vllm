@@ -68,26 +68,39 @@ class PriorityQueue(Generic[T]):
     def __iter__(self) -> Iterator[T]:
         return iter(self._queue)
 
-LLM_NUM_LAYERS = llm_server.get_num_layers()
-BLOCK_NBYTES = int(llm_server.get_block_nbytes())
-BLOCK_PER_LAYER_NBYTES = int(BLOCK_NBYTES // llm_server.get_num_layers())
-assert BLOCK_NBYTES % llm_server.get_num_layers() == 0
 
-_MPOOL_PAGE_NBYTES = 32 * 5 * 1024 * 1024
-PAGE_NBYTES = (
-    _MPOOL_PAGE_NBYTES * BLOCK_PER_LAYER_NBYTES // 
-    math.gcd(_MPOOL_PAGE_NBYTES, BLOCK_PER_LAYER_NBYTES)
-)
-N_BLOCKS_PER_PAGE = PAGE_NBYTES // BLOCK_PER_LAYER_NBYTES
-assert(PAGE_NBYTES % BLOCK_PER_LAYER_NBYTES == 0)
+if _use_llm_server_kv_cache_pool:
+    LLM_NUM_LAYERS = llm_server.get_num_layers()
+    BLOCK_NBYTES = int(llm_server.get_block_nbytes())
+    BLOCK_PER_LAYER_NBYTES = int(BLOCK_NBYTES // llm_server.get_num_layers())
+    assert BLOCK_NBYTES % llm_server.get_num_layers() == 0
 
-llm_server.info_with_frame(
-    '[DynamicBlockAllocator] '
-    f'BLOCK_NBYTES={BLOCK_NBYTES} | '
-    f'BLOCK_PER_LAYER_NBYTES={BLOCK_PER_LAYER_NBYTES} | '
-    f'PAGE_NBYTES={PAGE_NBYTES} | '
-    f'N_BLOCKS_PER_PAGE={N_BLOCKS_PER_PAGE}'
-)
+    _MPOOL_PAGE_NBYTES = 32 * 5 * 1024 * 1024
+    PAGE_NBYTES = (
+        _MPOOL_PAGE_NBYTES * BLOCK_PER_LAYER_NBYTES // 
+        math.gcd(_MPOOL_PAGE_NBYTES, BLOCK_PER_LAYER_NBYTES)
+    )
+    N_BLOCKS_PER_PAGE = PAGE_NBYTES // BLOCK_PER_LAYER_NBYTES
+    assert(PAGE_NBYTES % BLOCK_PER_LAYER_NBYTES == 0)
+
+    llm_server.info_with_frame(
+        '[DynamicBlockAllocator] '
+        f'BLOCK_NBYTES={BLOCK_NBYTES} | '
+        f'BLOCK_PER_LAYER_NBYTES={BLOCK_PER_LAYER_NBYTES} | '
+        f'PAGE_NBYTES={PAGE_NBYTES} | '
+        f'N_BLOCKS_PER_PAGE={N_BLOCKS_PER_PAGE}'
+    )
+else:
+    LLM_NUM_LAYERS = None
+    BLOCK_NBYTES = None
+    BLOCK_PER_LAYER_NBYTES = None
+    PAGE_NBYTES = None
+    N_BLOCKS_PER_PAGE = None
+
+    llm_server.info_with_frame(
+        '[DynamicBlockAllocator] _use_llm_server_kv_cache_pool=False')
+
+
 
 # assert(N_BLOCKS_PER_PAGE == 512)
 # assert(BLOCK_PER_LAYER_NBYTES == 2 * 81920 * 2)
@@ -97,7 +110,7 @@ class MemPage:
         self.page_id = page_id
         self.op_c = 0 # operation counter, for invalidating the free queue
         block_id_begin = page_id // BLOCK_PER_LAYER_NBYTES
-        assert(page_id % PAGE_NBYTES == 0)
+        assert(page_id % PAGE_NBYTES == 0), f'page_id {page_id}, PAGE_NBYTES {PAGE_NBYTES}'
         self.free_layer_block_ids = list(range(
             block_id_begin, block_id_begin + N_BLOCKS_PER_PAGE))
         self.used_layer_block_ids = list[int]()
